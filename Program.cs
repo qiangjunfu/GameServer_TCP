@@ -27,10 +27,6 @@ public class GameServer
     private static readonly int FrameRate = 60;
 
 
-    private static readonly ConcurrentDictionary<string, Room> Rooms = new(); // 存储所有房间
-    private static readonly ConcurrentDictionary<Socket, string> ClientRooms = new(); // 存储每个客户端所在的房间
-
-
 
 
     public static async Task Main(string[] args)
@@ -73,6 +69,11 @@ public class GameServer
 
 
 
+    private static readonly ConcurrentDictionary<string, Room> Rooms = new(); // 存储所有房间
+    private static readonly ConcurrentDictionary<Socket, string> ClientRooms = new(); // 存储每个客户端所在的房间
+
+    private static readonly ConcurrentDictionary<int, ClientSession> ClientSessions = new();  // 用于存储客户端会话信息
+
     public static async Task StartServer()
     {
         try
@@ -110,6 +111,38 @@ public class GameServer
 
 
                 await JoinRoom(clientSocket, defaultRoomId);
+                #region 断线重连
+                //if (!ClientSessions.ContainsKey(clientId))
+                //{
+                //    // 新客户端，加入默认房间并保存会话
+                //    await JoinRoom(clientSocket, defaultRoomId);
+                //    ClientSessions[clientId] = new ClientSession
+                //    {
+                //        ClientId = clientId,
+                //        RoomId = defaultRoomId,
+                //        LastActiveTime = DateTime.Now,
+                //        WasNormalExit = false // 设置为false，表示这是正常进入
+                //    };
+                //    Log($"新客户端 {clientId} 已加入默认房间.");
+                //}
+                //else
+                //{
+                //    // 如果是断线重连，检查是否正常退出
+                //    var session = ClientSessions[clientId];
+                //    if (session.WasNormalExit)
+                //    {
+                //        // 正常退出，进入默认大厅
+                //        await JoinRoom(clientSocket, defaultRoomId);
+                //        Log($"客户端 {clientId} 正常退出，重新进入默认大厅.");
+                //    }
+                //    else
+                //    {
+                //        // 断线重连，恢复之前的房间
+                //        await JoinRoom(clientSocket, session.RoomId);
+                //        Log($"客户端 {clientId} 断线重连，恢复房间 {session.RoomId}.");
+                //    }
+                //}
+                #endregion
 
 
                 _ = Task.Run(() => HandleClient(clientSocket));
@@ -421,7 +454,7 @@ public class GameServer
         }
 
         string currentRoomId = ClientRooms[clientSocket];  // 记录当前房间
-        var currentRoom = Rooms[currentRoomId];
+        Room currentRoom = Rooms[currentRoomId];
 
         currentRoom.RemoveClient(clientSocket);  // 从房间中移除客户端
         ClientRooms.TryRemove(clientSocket, out _);  // 移除客户端的房间记录
@@ -433,6 +466,59 @@ public class GameServer
 
         return true;
     }
+
+    public static async Task LeaveRoom(Socket clientSocket , bool isNormalExit)
+    {
+        if (!ClientRooms.ContainsKey(clientSocket))
+        {
+            Log($"客户端 {GetClientIdPoint(clientSocket)}  没有加入任何房间.");
+            return ;
+        }
+
+        try
+        {
+            int clientId = GetClientId(clientSocket); 
+
+            // 确保 ClientSessions 中包含该客户端的会话信息
+            if (ClientSessions.ContainsKey(clientId))
+            {
+                var session = ClientSessions[clientId];
+                session.WasNormalExit = isNormalExit;  
+                ClientSessions[clientId] = session;  // 更新会话数据
+
+
+                // 从房间移除客户端并清理资源
+                string currentRoomId = session.RoomId;
+                // 确保房间存在
+                if (Rooms.ContainsKey(currentRoomId))
+                {
+                    Room currentRoom = Rooms[currentRoomId];
+                    currentRoom.RemoveClient(clientSocket);  // 从房间移除客户端
+
+                    // 清除客户端的房间信息
+                    ClientRooms.TryRemove(clientSocket, out _);
+
+                    // 通知其他玩家该客户端离开房间
+                    await BroadcastClientJoinOrLeave(clientSocket, currentRoomId, false);  // false 表示离开房间
+                    
+                    Log($"客户端 {GetClientIdPoint(clientSocket)} 已离开房间 {currentRoomId} ");
+                }
+                else
+                {
+                    Log($"房间 {currentRoomId} 不存在，无法移除客户端 {GetClientIdPoint(clientSocket)}");
+                }
+            }
+            else
+            {
+                Log($"客户端 {GetClientIdPoint(clientSocket)} 不在会话中，无法执行退出操作");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"处理客户端离开房间时发生错误: {ex.Message}");
+        }
+    }
+
 
     public static async Task<bool> SwitchRoom(Socket clientSocket, string newRoomId)
     {
@@ -574,6 +660,18 @@ public class GameServer
 
 
 
+    public static int GetClientId(Socket clientSocket)
+    {
+        if (ClientIds.ContainsKey(clientSocket))
+        {
+            return ClientIds[clientSocket];
+        }
+        else
+        {
+            Log($"客户端ID未找到 {clientSocket.RemoteEndPoint}");
+            return -1;
+        }
+    }
     public static string GetClientIdPoint(Socket clientSocket)
     {
         return $"{clientSocket.RemoteEndPoint}___{ClientIds[clientSocket]}";
