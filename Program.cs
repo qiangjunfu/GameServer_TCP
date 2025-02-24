@@ -112,36 +112,13 @@ public class GameServer
 
                 await JoinRoom(clientSocket, defaultRoomId);
                 #region 断线重连
-                //if (!ClientSessions.ContainsKey(clientId))
-                //{
-                //    // 新客户端，加入默认房间并保存会话
-                //    await JoinRoom(clientSocket, defaultRoomId);
-                //    ClientSessions[clientId] = new ClientSession
-                //    {
-                //        ClientId = clientId,
-                //        RoomId = defaultRoomId,
-                //        LastActiveTime = DateTime.Now,
-                //        WasNormalExit = false // 设置为false，表示这是正常进入
-                //    };
-                //    Log($"新客户端 {clientId} 已加入默认房间.");
-                //}
-                //else
-                //{
-                //    // 如果是断线重连，检查是否正常退出
-                //    var session = ClientSessions[clientId];
-                //    if (session.WasNormalExit)
-                //    {
-                //        // 正常退出，进入默认大厅
-                //        await JoinRoom(clientSocket, defaultRoomId);
-                //        Log($"客户端 {clientId} 正常退出，重新进入默认大厅.");
-                //    }
-                //    else
-                //    {
-                //        // 断线重连，恢复之前的房间
-                //        await JoinRoom(clientSocket, session.RoomId);
-                //        Log($"客户端 {clientId} 断线重连，恢复房间 {session.RoomId}.");
-                //    }
-                //}
+                //逻辑应该是: 服务器向客户端发送一个已连接消息,客户端通过消息先判断本地有没有clientId,
+                //            如果没有向服务器请求一个新clientId , 如果有就直接发送本地保存的clientId
+                //string msg = $"客户端: {clientSocket.RemoteEndPoint}  连接到服务器: {GetLocalIPAddress()}";
+                //byte[] message = Encoding.UTF8.GetBytes(msg);
+                //await clientSocket.SendAsync(new ArraySegment<byte>(message), SocketFlags.None);
+                //Log(msg);
+
                 #endregion
 
 
@@ -234,9 +211,15 @@ public class GameServer
                         {
                             if (networkMessage == null) return;
 
-                            string roomId = "";
                             switch (networkMessage?.MessageType)
                             {
+                                case NetworkMessageType.GetClientId:
+                                    ClientIdMessage clientIdMessage = ByteArrayToJson<ClientIdMessage>(networkMessage.Data);
+                                    if (clientIdMessage != null)
+                                    {
+                                        await ProcessMessage_GetClientId(clientSocket, clientIdMessage);
+                                    }
+                                    break;
                                 case NetworkMessageType.JoinRoom:
                                     break;
                                 case NetworkMessageType.LeaveRoom:
@@ -275,7 +258,7 @@ public class GameServer
     }
 
 
-
+    #region 接收消息处理
     public static async Task ProcessMessage(Socket clientSocket, byte[] message)
     {
         if (TryParseNetworkMessage(message, out NetworkMessage networkMessage))
@@ -290,6 +273,69 @@ public class GameServer
             await BroadcastMessage(clientSocket, receivedMessage);
         }
     }
+
+    public static async Task ProcessMessage_GetClientId(Socket clientSocket, ClientIdMessage clientIdMessage)
+    {
+        //如果客户端没有ID 则服务器分配一个 然后发送给客户端
+        // 如果有ID 则检查是否在ClientSessions中,如果在则是断线重连,如果不在则是新客户端
+        if (clientIdMessage.ClientId == -1)
+        {
+            string clientKey = $"{clientSocket.RemoteEndPoint}___{clientIdCounter}";
+            Clients[clientKey] = clientSocket;
+            int clientId = clientIdCounter;
+            ClientIds[clientSocket] = clientId;
+            clientIdCounter += 1;
+            Log($"客户端连接: {clientSocket.RemoteEndPoint}， 客户端分配的新ID: {clientId}");
+
+            ClientIdMessage clientIdMessage2 = new ClientIdMessage
+            {
+                ClientId = ClientIds[clientSocket],
+                ClientType = clientIdMessage.ClientType,
+                GlobalObjId = clientIdMessage.GlobalObjId
+            };
+            NetworkMessage networkMessage = new NetworkMessage(NetworkMessageType.GetClientId, JsonToByteArray<ClientIdMessage>(clientIdMessage2));
+            byte[] combinedMessage = PrepareNetworkMessage(networkMessage);
+            await clientSocket.SendAsync(new ArraySegment<byte>(combinedMessage), SocketFlags.None);
+        }
+        else
+        {
+            // 新客户端，加入默认房间并保存会话
+            if (!ClientSessions.ContainsKey(clientIdMessage.ClientId))
+            {
+                await JoinRoom(clientSocket, defaultRoomId);
+                ClientSessions[clientIdMessage.ClientId] = new ClientSession
+                {
+                    ClientId = clientIdMessage.ClientId,
+                    RoomId = defaultRoomId,
+                    LastActiveTime = DateTime.Now,
+                    WasNormalExit = false // 设置为false，表示这是正常进入
+                };
+            }
+            else   // 旧客户端
+            {
+                // 如果是断线重连，检查是否正常退出
+                var session = ClientSessions[clientIdMessage.ClientId];
+                if (session.WasNormalExit)
+                {
+                    // 正常退出，进入默认大厅
+                    await JoinRoom(clientSocket, defaultRoomId);
+                    Log($"客户端 {clientIdMessage.ClientId} 正常退出，重新进入默认大厅.");
+                }
+                else
+                {
+                    // 断线重连，恢复之前的房间
+                    await JoinRoom(clientSocket, session.RoomId);
+                    Log($"客户端 {clientIdMessage.ClientId} 断线重连，恢复房间 {session.RoomId}.");
+                }
+            }
+        }
+    }
+
+
+    #endregion
+
+
+    #region 广播消息处理
 
     public static async Task BroadcastMessage(Socket senderSocket, string message)
     {
@@ -427,6 +473,40 @@ public class GameServer
     }
 
 
+    public static byte[] PrepareMessage(string message)
+    {
+        byte[] header = Encoding.UTF8.GetBytes("HEADER");
+        byte[] messageBytes = Encoding.UTF8.GetBytes(message);
+        byte[] lengthBytes = BitConverter.GetBytes(messageBytes.Length);
+
+        byte[] combinedMessage = new byte[header.Length + lengthBytes.Length + messageBytes.Length];
+        Array.Copy(header, 0, combinedMessage, 0, header.Length);
+        Array.Copy(lengthBytes, 0, combinedMessage, header.Length, lengthBytes.Length);
+        Array.Copy(messageBytes, 0, combinedMessage, header.Length + lengthBytes.Length, messageBytes.Length);
+
+        return combinedMessage;
+    }
+    public static byte[] PrepareNetworkMessage(NetworkMessage networkMessage)
+    {
+        byte[] header = Encoding.UTF8.GetBytes("HEADER");
+        byte[] typeBytes = BitConverter.GetBytes((int)networkMessage.MessageType);
+        byte[] dataBytes = networkMessage.Data;
+        byte[] lengthBytes = BitConverter.GetBytes(typeBytes.Length + dataBytes.Length);
+
+        byte[] combinedMessage = new byte[header.Length + lengthBytes.Length + typeBytes.Length + dataBytes.Length];
+        Array.Copy(header, 0, combinedMessage, 0, header.Length);
+        Array.Copy(lengthBytes, 0, combinedMessage, header.Length, lengthBytes.Length);
+        Array.Copy(typeBytes, 0, combinedMessage, header.Length + lengthBytes.Length, typeBytes.Length);
+        Array.Copy(dataBytes, 0, combinedMessage, header.Length + lengthBytes.Length + typeBytes.Length, dataBytes.Length);
+
+        //Log($"PrepareNetworkMessage() - 包头长度: {header.Length}, 包体长度: {lengthBytes.Length}, 消息类型长度: {typeBytes.Length}, 数据长度: {dataBytes.Length}, 总长度: {combinedMessage.Length}");
+
+        return combinedMessage;
+    }
+
+    #endregion
+
+
     #region 房间管理
     static string defaultRoomId = "defaultRoom";
 
@@ -467,30 +547,30 @@ public class GameServer
         return true;
     }
 
-    public static async Task LeaveRoom(Socket clientSocket , bool isNormalExit)
+    public static async Task LeaveRoom(Socket clientSocket, bool isNormalExit)
     {
         if (!ClientRooms.ContainsKey(clientSocket))
         {
             Log($"客户端 {GetClientIdPoint(clientSocket)}  没有加入任何房间.");
-            return ;
+            return;
         }
 
         try
         {
-            int clientId = GetClientId(clientSocket); 
+            int clientId = GetClientId(clientSocket);
 
             // 确保 ClientSessions 中包含该客户端的会话信息
             if (ClientSessions.ContainsKey(clientId))
             {
                 var session = ClientSessions[clientId];
-                session.WasNormalExit = isNormalExit;  
+                session.WasNormalExit = isNormalExit;
                 ClientSessions[clientId] = session;  // 更新会话数据
 
 
                 // 从房间移除客户端并清理资源
                 string currentRoomId = session.RoomId;
                 // 确保房间存在
-                if (Rooms.ContainsKey(currentRoomId))
+                if (currentRoomId != null && Rooms.ContainsKey(currentRoomId))
                 {
                     Room currentRoom = Rooms[currentRoomId];
                     currentRoom.RemoveClient(clientSocket);  // 从房间移除客户端
@@ -500,7 +580,7 @@ public class GameServer
 
                     // 通知其他玩家该客户端离开房间
                     await BroadcastClientJoinOrLeave(clientSocket, currentRoomId, false);  // false 表示离开房间
-                    
+
                     Log($"客户端 {GetClientIdPoint(clientSocket)} 已离开房间 {currentRoomId} ");
                 }
                 else
@@ -549,54 +629,26 @@ public class GameServer
         roomMessage?.PrintInfo();
         return roomMessage;
     }
-    public static byte[] JsonToByteArray<T>(T message)
+    public static byte[] JsonToByteArray<T>(T message) where T : ClientMessageBase
     {
         string jsonString = JsonConvert.SerializeObject(message);
         //print($"JsonToByteArray : {jsonString}");
         return Encoding.UTF8.GetBytes(jsonString);
     }
-    public static T ByteArrayToJson<T>(byte[] data)
+    public static T ByteArrayToJson<T>(byte[] data) where T : ClientMessageBase
     {
         string jsonString = Encoding.UTF8.GetString(data);
+        T t = JsonConvert.DeserializeObject<T>(jsonString);
         //print($"ByteArrayToJson : {jsonString}");
-        return JsonConvert.DeserializeObject<T>(jsonString);
+        t.PrintInfo();
+        return t;
     }
 
     #endregion
 
 
-    public static byte[] PrepareMessage(string message)
-    {
-        byte[] header = Encoding.UTF8.GetBytes("HEADER");
-        byte[] messageBytes = Encoding.UTF8.GetBytes(message);
-        byte[] lengthBytes = BitConverter.GetBytes(messageBytes.Length);
 
-        byte[] combinedMessage = new byte[header.Length + lengthBytes.Length + messageBytes.Length];
-        Array.Copy(header, 0, combinedMessage, 0, header.Length);
-        Array.Copy(lengthBytes, 0, combinedMessage, header.Length, lengthBytes.Length);
-        Array.Copy(messageBytes, 0, combinedMessage, header.Length + lengthBytes.Length, messageBytes.Length);
-
-        return combinedMessage;
-    }
-    public static byte[] PrepareNetworkMessage(NetworkMessage networkMessage)
-    {
-        byte[] header = Encoding.UTF8.GetBytes("HEADER");
-        byte[] typeBytes = BitConverter.GetBytes((int)networkMessage.MessageType);
-        byte[] dataBytes = networkMessage.Data;
-        byte[] lengthBytes = BitConverter.GetBytes(typeBytes.Length + dataBytes.Length);
-
-        byte[] combinedMessage = new byte[header.Length + lengthBytes.Length + typeBytes.Length + dataBytes.Length];
-        Array.Copy(header, 0, combinedMessage, 0, header.Length);
-        Array.Copy(lengthBytes, 0, combinedMessage, header.Length, lengthBytes.Length);
-        Array.Copy(typeBytes, 0, combinedMessage, header.Length + lengthBytes.Length, typeBytes.Length);
-        Array.Copy(dataBytes, 0, combinedMessage, header.Length + lengthBytes.Length + typeBytes.Length, dataBytes.Length);
-
-        //Log($"PrepareNetworkMessage() - 包头长度: {header.Length}, 包体长度: {lengthBytes.Length}, 消息类型长度: {typeBytes.Length}, 数据长度: {dataBytes.Length}, 总长度: {combinedMessage.Length}");
-
-        return combinedMessage;
-    }
-
-
+    #region  其他
 
     private static void RemoveClient(Socket clientSocket)
     {
@@ -732,7 +784,7 @@ public class GameServer
             }
         }
     }
-
+    #endregion
 
 }
 

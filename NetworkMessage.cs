@@ -33,7 +33,14 @@ public enum NetworkMessageType
 
     JoinRoom,
     LeaveRoom,
-    SwitchRoom
+    SwitchRoom,
+
+
+    /// <summary>
+    /// 服务器获取客户端ID, 如果有则保存会话, 没有则创建id后发送给客户端
+    /// </summary>
+    GetClientId
+
 }
 
 
@@ -101,4 +108,10 @@ public class RoomMessage : ClientMessageBase
         Console.WriteLine(info);
         return info;
     }
+}
+
+
+public class ClientIdMessage : ClientMessageBase
+{
+    
 }
