@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.IO;
 using Newtonsoft.Json;
+using static System.Collections.Specialized.BitVector32;
 
 
 public class GameServer
@@ -20,7 +21,7 @@ public class GameServer
     private const int Port = 12345;
     private const int BufferSize = 1024;
     private const int maxClientCount = 50;
-    private static readonly string LogFilePath = "server_log.txt"; // 日志文件路径
+    private static string LogFilePath = "server_log.txt";
 
 
     private static readonly ConcurrentQueue<MessageWithSender> MessageQueue = new();
@@ -72,12 +73,16 @@ public class GameServer
     private static readonly ConcurrentDictionary<string, Room> Rooms = new(); // 存储所有房间
     private static readonly ConcurrentDictionary<Socket, string> ClientRooms = new(); // 存储每个客户端所在的房间
 
-    private static readonly ConcurrentDictionary<int, ClientSession> ClientSessions = new();  // 用于存储客户端会话信息
+    private static ConcurrentDictionary<int, ClientSession> ClientSessions = new();  // 用于存储客户端会话信息
 
     public static async Task StartServer()
     {
         try
         {
+            LogFilePath = Path.Combine(Directory.GetCurrentDirectory(), "data", "server_log.txt");
+            sessionFilePath = Path.Combine(Directory.GetCurrentDirectory(), "data", "client_sessions.json");
+            LoadSessionsFromFile(sessionFilePath);
+
             serverListener = new TcpListener(IPAddress.Any, Port);
             serverListener.Start();
 
@@ -97,30 +102,6 @@ public class GameServer
                     clientSocket.Close();
                     continue; // 不接受这个客户端，直接跳过
                 }
-
-                string clientKey = $"{clientSocket.RemoteEndPoint}___{clientIdCounter}";
-                Clients[clientKey] = clientSocket;
-                int clientId = clientIdCounter;
-                ClientIds[clientSocket] = clientId;
-                clientIdCounter += 1;
-                Log($"客户端连接: {clientSocket.RemoteEndPoint}，客户端ID: {clientId}");
-
-                byte[] idMessage = Encoding.UTF8.GetBytes(clientId.ToString());
-                await clientSocket.SendAsync(new ArraySegment<byte>(idMessage), SocketFlags.None);
-                Log($"已向 {clientSocket.RemoteEndPoint} 发送客户端ID: {clientId}");
-
-
-                await JoinRoom(clientSocket, defaultRoomId);
-                #region 断线重连
-                //逻辑应该是: 服务器向客户端发送一个已连接消息,客户端通过消息先判断本地有没有clientId,
-                //            如果没有向服务器请求一个新clientId , 如果有就直接发送本地保存的clientId
-                //string msg = $"客户端: {clientSocket.RemoteEndPoint}  连接到服务器: {GetLocalIPAddress()}";
-                //byte[] message = Encoding.UTF8.GetBytes(msg);
-                //await clientSocket.SendAsync(new ArraySegment<byte>(message), SocketFlags.None);
-                //Log(msg);
-
-                #endregion
-
 
                 _ = Task.Run(() => HandleClient(clientSocket));
             }
@@ -240,9 +221,6 @@ public class GameServer
                                     break;
                             }
                         }
-                        //Log($"收到来自客户端 {GetClientIdPoint(clientSocket)} NetworkMessage: 类型={networkMessage.MessageType}");
-                        //MessageQueue.Enqueue(networkMessage);
-                        ////await ProcessMessage(clientSocket, body);
                     }
                 }
             }
@@ -259,71 +237,105 @@ public class GameServer
 
 
     #region 接收消息处理
-    public static async Task ProcessMessage(Socket clientSocket, byte[] message)
-    {
-        if (TryParseNetworkMessage(message, out NetworkMessage networkMessage))
-        {
-            Log($"收到来自客户端 {GetClientIdPoint(clientSocket)} NetworkMessage: 类型={networkMessage.MessageType}");
-            await BroadcastNetworkMessage(clientSocket, networkMessage);
-        }
-        else
-        {
-            string receivedMessage = Encoding.UTF8.GetString(message);
-            Log($"收到来自客户端 {GetClientIdPoint(clientSocket)} 的消息: {receivedMessage}");
-            await BroadcastMessage(clientSocket, receivedMessage);
-        }
-    }
-
     public static async Task ProcessMessage_GetClientId(Socket clientSocket, ClientIdMessage clientIdMessage)
     {
         //如果客户端没有ID 则服务器分配一个 然后发送给客户端
         // 如果有ID 则检查是否在ClientSessions中,如果在则是断线重连,如果不在则是新客户端
         if (clientIdMessage.ClientId == -1)
         {
+            bool isExist = IsExistClientId(clientIdCounter);
+            while (isExist)
+            {
+                clientIdCounter += 1;
+                isExist = IsExistClientId(clientIdCounter);
+            }
             string clientKey = $"{clientSocket.RemoteEndPoint}___{clientIdCounter}";
             Clients[clientKey] = clientSocket;
+
             int clientId = clientIdCounter;
             ClientIds[clientSocket] = clientId;
             clientIdCounter += 1;
-            Log($"客户端连接: {clientSocket.RemoteEndPoint}， 客户端分配的新ID: {clientId}");
+            //Log($"客户端连接: {clientSocket.RemoteEndPoint}， 客户端分配的新ID: {clientId}");
+            clientHeartbeats[clientSocket] = DateTime.Now;
 
+
+            // 将服务器分配新ID 发送给客户端
             ClientIdMessage clientIdMessage2 = new ClientIdMessage
             {
-                ClientId = ClientIds[clientSocket],
+                ClientId = clientId,
                 ClientType = clientIdMessage.ClientType,
                 GlobalObjId = clientIdMessage.GlobalObjId
             };
             NetworkMessage networkMessage = new NetworkMessage(NetworkMessageType.GetClientId, JsonToByteArray<ClientIdMessage>(clientIdMessage2));
             byte[] combinedMessage = PrepareNetworkMessage(networkMessage);
             await clientSocket.SendAsync(new ArraySegment<byte>(combinedMessage), SocketFlags.None);
+
+
+            await JoinRoom(clientSocket, defaultRoomId);
+
+            ClientSessions[clientId] = new ClientSession
+            {
+                ClientId = clientId,
+                RoomId = defaultRoomId,
+                LastActiveTime = DateTime.Now,
+                WasNormalExit = false
+            };
+
+            Log($"客户端 {clientIdMessage.ClientId} 是新客户端且 服务器分配新ID: {clientId} ，进入默认大厅.");
         }
         else
         {
-            // 新客户端，加入默认房间并保存会话
+            string clientKey = $"{clientSocket.RemoteEndPoint}___{clientIdCounter}";
+            Clients[clientKey] = clientSocket;
+            ClientIds[clientSocket] = clientIdMessage.ClientId;
+            clientHeartbeats[clientSocket] = DateTime.Now;
+
+            // 将服务器原来保存的ID 发送给客户端
+            ClientIdMessage clientIdMessage2 = new ClientIdMessage
+            {
+                ClientId = clientIdMessage.ClientId,
+                ClientType = clientIdMessage.ClientType,
+                GlobalObjId = clientIdMessage.GlobalObjId
+            };
+            NetworkMessage networkMessage = new NetworkMessage(NetworkMessageType.GetClientId, JsonToByteArray<ClientIdMessage>(clientIdMessage2));
+            byte[] combinedMessage = PrepareNetworkMessage(networkMessage);
+            await clientSocket.SendAsync(new ArraySegment<byte>(combinedMessage), SocketFlags.None);
+
+
+            // 如果 ClientSessions 中没有该客户端的会话信息，从文件中加载
+            if (!ClientSessions.ContainsKey(clientIdMessage.ClientId))
+            {
+                // 重新加载会话数据
+                LoadSessionsFromFile(sessionFilePath);
+            }
+
+            // 如果加载后仍然没有，说明是新客户端
             if (!ClientSessions.ContainsKey(clientIdMessage.ClientId))
             {
                 await JoinRoom(clientSocket, defaultRoomId);
-                ClientSessions[clientIdMessage.ClientId] = new ClientSession
+
+                var session = new ClientSession
                 {
                     ClientId = clientIdMessage.ClientId,
                     RoomId = defaultRoomId,
                     LastActiveTime = DateTime.Now,
-                    WasNormalExit = false // 设置为false，表示这是正常进入
+                    WasNormalExit = false
                 };
+                ClientSessions[clientIdMessage.ClientId] = session;
+                Log($"客户端 {clientIdMessage.ClientId} 是老客户端且(ID!=-1) . {session.PrintInfo()} ");
             }
             else   // 旧客户端
             {
                 // 如果是断线重连，检查是否正常退出
                 var session = ClientSessions[clientIdMessage.ClientId];
+                Log($"客户端 {clientIdMessage.ClientId} 是老客户端 ,  {session.PrintInfo()} ");
                 if (session.WasNormalExit)
                 {
-                    // 正常退出，进入默认大厅
                     await JoinRoom(clientSocket, defaultRoomId);
                     Log($"客户端 {clientIdMessage.ClientId} 正常退出，重新进入默认大厅.");
                 }
                 else
                 {
-                    // 断线重连，恢复之前的房间
                     await JoinRoom(clientSocket, session.RoomId);
                     Log($"客户端 {clientIdMessage.ClientId} 断线重连，恢复房间 {session.RoomId}.");
                 }
@@ -524,30 +536,7 @@ public class GameServer
 
         await BroadcastClientJoinOrLeave(clientSocket, roomId, true);
     }
-
-    public static async Task<bool> LeaveRoom(Socket clientSocket)
-    {
-        if (!ClientRooms.ContainsKey(clientSocket))
-        {
-            Log($"客户端 {GetClientIdPoint(clientSocket)}  没有加入任何房间.");
-            return false;
-        }
-
-        string currentRoomId = ClientRooms[clientSocket];  // 记录当前房间
-        Room currentRoom = Rooms[currentRoomId];
-
-        currentRoom.RemoveClient(clientSocket);  // 从房间中移除客户端
-        ClientRooms.TryRemove(clientSocket, out _);  // 移除客户端的房间记录
-        await BroadcastClientJoinOrLeave(clientSocket, currentRoomId, false); // 异步广播客户端离开房间
-
-        //await JoinRoom(clientSocket, defaultRoomId);        // 将客户端加入默认大厅房间
-        //Log($"客户端 {GetClientIdPoint(clientSocket)} 已离开房间 {currentRoomId} , 并重新加入大厅房间 {defaultRoomId}");
-        Log($"客户端 {GetClientIdPoint(clientSocket)} 已离开房间 {currentRoomId} ");
-
-        return true;
-    }
-
-    public static async Task LeaveRoom(Socket clientSocket, bool isNormalExit)
+    public static async Task LeaveRoom(Socket clientSocket)
     {
         if (!ClientRooms.ContainsKey(clientSocket))
         {
@@ -557,41 +546,25 @@ public class GameServer
 
         try
         {
-            int clientId = GetClientId(clientSocket);
-
-            // 确保 ClientSessions 中包含该客户端的会话信息
-            if (ClientSessions.ContainsKey(clientId))
+            string currentRoomId = ClientRooms[clientSocket];
+            if (currentRoomId != null && Rooms.ContainsKey(currentRoomId))
             {
-                var session = ClientSessions[clientId];
-                session.WasNormalExit = isNormalExit;
-                ClientSessions[clientId] = session;  // 更新会话数据
+                Room currentRoom = Rooms[currentRoomId];
+                // 从房间移除客户端
+                currentRoom.RemoveClient(clientSocket);
+                // 清除客户端的房间信息
+                ClientRooms.TryRemove(clientSocket, out _);
 
+                // 通知其他玩家该客户端离开房间 , false 表示离开房间
+                await BroadcastClientJoinOrLeave(clientSocket, currentRoomId, false);
 
-                // 从房间移除客户端并清理资源
-                string currentRoomId = session.RoomId;
-                // 确保房间存在
-                if (currentRoomId != null && Rooms.ContainsKey(currentRoomId))
-                {
-                    Room currentRoom = Rooms[currentRoomId];
-                    currentRoom.RemoveClient(clientSocket);  // 从房间移除客户端
-
-                    // 清除客户端的房间信息
-                    ClientRooms.TryRemove(clientSocket, out _);
-
-                    // 通知其他玩家该客户端离开房间
-                    await BroadcastClientJoinOrLeave(clientSocket, currentRoomId, false);  // false 表示离开房间
-
-                    Log($"客户端 {GetClientIdPoint(clientSocket)} 已离开房间 {currentRoomId} ");
-                }
-                else
-                {
-                    Log($"房间 {currentRoomId} 不存在，无法移除客户端 {GetClientIdPoint(clientSocket)}");
-                }
+                Log($"客户端 {GetClientIdPoint(clientSocket)} 已离开房间 {currentRoomId} ");
             }
             else
             {
-                Log($"客户端 {GetClientIdPoint(clientSocket)} 不在会话中，无法执行退出操作");
+                Log($"房间 {currentRoomId} 不存在，无法移除客户端 {GetClientIdPoint(clientSocket)}");
             }
+
         }
         catch (Exception ex)
         {
@@ -622,6 +595,47 @@ public class GameServer
         return true;
     }
 
+
+    private static void RemoveClient(Socket clientSocket)
+    {
+        try
+        {
+            if (ClientIds.TryRemove(clientSocket, out int clientId))
+            {
+                var clientKey = $"{clientSocket.RemoteEndPoint}___{clientId}";
+                Clients.TryRemove(clientKey, out _);
+                //ClientIds.TryRemove(clientSocket, out _);
+                clientHeartbeats.TryRemove(clientSocket, out _);
+
+                if (ClientSessions.TryRemove(clientId, out ClientSession session))
+                {
+                    // 在客户端断开连接时，将该客户端的会话数据追加到文件中
+                    SaveClientSessionToFile(clientId, session);
+                }
+
+                clientSocket.Dispose();
+                Log($"客户端 {clientKey} 已断开连接并清理资源。");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"移除客户端时发生异常: {ex.Message}");
+        }
+
+        //var clientEndPoint = clientSocket.RemoteEndPoint; // 提前保存
+        //var clientId = ClientIds[clientSocket];
+
+        //var clientKey = $"{GetClientIdPoint(clientSocket)}";
+        //if (Clients.ContainsKey(clientKey))
+        //{
+        //    Clients.TryRemove(clientKey, out _);
+        //    ClientIds.TryRemove(clientSocket, out _);
+        //    clientSocket.Dispose();
+        //    Log($"客户端 {clientKey} 已断开连接并清理资源。");
+        //}
+    }
+
+
     public static RoomMessage HandleRoomMessage(byte[] data)
     {
         string jsonMessage = System.Text.Encoding.UTF8.GetString(data);
@@ -648,41 +662,134 @@ public class GameServer
 
 
 
-    #region  其他
-
-    private static void RemoveClient(Socket clientSocket)
+    #region  客户端离开 . 会话保存
+    static string sessionFilePath = "";
+    public static void SaveClientSessionToFile(int clientId, ClientSession session)
     {
         try
         {
-            if (ClientIds.TryRemove(clientSocket, out int clientId))
+            string json = JsonConvert.SerializeObject(session, Formatting.Indented);
+
+            // 判断文件是否存在，若不存在则创建一个新的
+            if (!File.Exists(sessionFilePath))
             {
-                var clientKey = $"{clientSocket.RemoteEndPoint}___{clientId}";
-                Clients.TryRemove(clientKey, out _);
-                //ClientIds.TryRemove(clientSocket, out _);
-                clientSocket.Dispose();
-                Log($"客户端 {clientKey} 已断开连接并清理资源。");
+                string directoryPath = Path.GetDirectoryName(sessionFilePath);
+                if (!Directory.Exists(directoryPath))
+                {
+                    Directory.CreateDirectory(directoryPath);
+                    Log($"目录 {directoryPath} 已创建");
+                }
+
+                using (FileStream fs = File.Create(sessionFilePath))
+                {
+                    // 文件创建后，可以选择初始化为空的 JSON 数组
+                    string emptyJson = "[]";
+                    byte[] bytes = Encoding.UTF8.GetBytes(emptyJson);
+                    fs.Write(bytes, 0, bytes.Length);
+                }
+                Log($"未找到会话数据文件，已创建空文件 {sessionFilePath}");
+            }
+            else
+            {
+                var existingContent = File.ReadAllText(sessionFilePath);
+                List<ClientSession> sessions = JsonConvert.DeserializeObject<List<ClientSession>>(existingContent);
+
+                bool found = false;
+                for (int i = 0; i < sessions.Count; i++)
+                {
+                    if (sessions[i].ClientId == clientId)
+                    {
+                        sessions[i] = session;
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (!found)
+                {
+                    sessions.Add(session);
+                }
+
+                string updatedJson = JsonConvert.SerializeObject(sessions, Formatting.Indented);
+
+                File.WriteAllText(sessionFilePath, updatedJson);
+            }
+
+            Log($"客户端 {clientId} 会话数据已保存到 {sessionFilePath}");
+        }
+        catch (Exception ex)
+        {
+            Log($"保存客户端会话数据时发生错误: {ex.Message}");
+        }
+    }
+    public static void SaveAllSessionsToFile()
+    {
+        try
+        {
+            // 遍历所有客户端会话，并保存
+            foreach (var session in ClientSessions.Values)
+            {
+                SaveClientSessionToFile(session.ClientId, session);
+            }
+
+            Log("所有客户端会话数据已保存到 client_sessions.json");
+        }
+        catch (Exception ex)
+        {
+            Log($"保存所有会话数据时发生错误: {ex.Message}");
+        }
+    }
+
+    public static void LoadSessionsFromFile(string filePath)
+    {
+        try
+        {
+            string directoryPath = Path.GetDirectoryName(filePath);
+            if (!Directory.Exists(directoryPath))
+            {
+                Directory.CreateDirectory(directoryPath);
+                Log($"目录 {directoryPath} 已创建");
+            }
+
+
+            if (File.Exists(filePath))
+            {
+                string json = File.ReadAllText(filePath);
+                List<ClientSession> sessions = JsonConvert.DeserializeObject<List<ClientSession>>(json);
+
+                foreach (var session in sessions)
+                {
+                    if (!ClientSessions.ContainsKey(session.ClientId))
+                    {
+                        ClientSessions[session.ClientId] = session;
+                        Log($"{filePath}  恢复客户端 {session.ClientId} 的会话数据");
+                    }
+                }
+            }
+            else
+            {
+                using (FileStream fs = File.Create(filePath))
+                {
+                    // 文件创建后，可以选择初始化为空的 JSON 数组
+                    string emptyJson = "[]";
+                    byte[] bytes = Encoding.UTF8.GetBytes(emptyJson);
+                    fs.Write(bytes, 0, bytes.Length);
+                }
+                Log($"未找到会话数据文件，已创建空文件 {filePath}");
             }
         }
         catch (Exception ex)
         {
-            Log($"移除客户端时发生异常: {ex.Message}");
+            Log($"加载会话数据时发生错误: {ex.Message}");
         }
-
-        //var clientEndPoint = clientSocket.RemoteEndPoint; // 提前保存
-        //var clientId = ClientIds[clientSocket];
-
-        //var clientKey = $"{GetClientIdPoint(clientSocket)}";
-        //if (Clients.ContainsKey(clientKey))
-        //{
-        //    Clients.TryRemove(clientKey, out _);
-        //    ClientIds.TryRemove(clientSocket, out _);
-        //    clientSocket.Dispose();
-        //    Log($"客户端 {clientKey} 已断开连接并清理资源。");
-        //}
     }
 
     public static async Task ShutdownServer()
     {
+        // 保存所有会话数据
+        SaveAllSessionsToFile();
+
+
         foreach (var kvp in Clients)
         {
             var clientKey = kvp.Key;
@@ -710,8 +817,23 @@ public class GameServer
         Log("服务器已关闭。");
     }
 
+    #endregion
 
 
+
+    #region  其他
+    public static bool IsExistClientId(int clientId)
+    {
+        foreach (var kvp in ClientIds)
+        {
+            if (kvp.Value == clientId)
+            {
+                Log($"IsExistClientId()  客户端ID已存在: {clientId}");
+                return true;
+            }
+        }
+        return false;
+    }
     public static int GetClientId(Socket clientSocket)
     {
         if (ClientIds.ContainsKey(clientSocket))
@@ -874,4 +996,5 @@ public class CircularBuffer
         head = (head + length) % buffer.Length;
         count -= length;
     }
+
 }
