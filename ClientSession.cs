@@ -15,7 +15,7 @@ public class ClientSession
     public  string PrintInfo()
     {
 
-        string info = $"会话消息 --- ClientId: {ClientId}, 客户端所在房间: {RoomId}";
+        string info = $"会话消息 ClientId: {ClientId}, 客户端所在房间: {RoomId}";
         //Console.WriteLine(info);
         return info;
     }

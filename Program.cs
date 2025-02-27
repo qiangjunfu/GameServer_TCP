@@ -251,7 +251,7 @@ public class GameServer
     #region 接收消息处理
     public static async Task ProcessMessage_GetClientId(Socket clientSocket, ClientIdMessage clientIdMessage)
     {
-        //如果客户端没有ID 则服务器分配一个 然后发送给客户端
+        //如果客户端没有ID(-1) 则服务器分配一个 然后发送给客户端
         // 如果有ID 则检查是否在ClientSessions中,如果在则是断线重连,如果不在则是新客户端
         if (clientIdMessage.ClientId <= 0)
         {
@@ -436,11 +436,11 @@ public class GameServer
                     try
                     {
                         await clientSocket.SendAsync(new ArraySegment<byte>(combinedMessage), SocketFlags.None);
-                        Log($"广播网络数据给客户端: {clientKey}");
+                        Log($"广播网络数据给客户端: {GetClientIdPoint(clientSocket)}");
                     }
                     catch (Exception ex)
                     {
-                        Log($"广播网络数据到客户端 {kvp.Key} 失败: {ex.Message}");
+                        Log($"广播网络数据到客户端 {GetClientIdPoint(clientSocket)} 失败: {ex.Message}");
                         RemoveClient(clientSocket);
                     }
                 }));
@@ -770,7 +770,7 @@ public class GameServer
                     if (!ClientSessions.ContainsKey(session.ClientId))
                     {
                         ClientSessions[session.ClientId] = session;
-                        Log($"{filePath}  恢复客户端 {session.ClientId} 的会话数据");
+                        Log($"恢复客户端 {session.ClientId} 的会话数据: {session.PrintInfo()}");
                     }
                 }
             }
