@@ -9,7 +9,6 @@ using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.IO;
 using Newtonsoft.Json;
-using static System.Collections.Specialized.BitVector32;
 
 
 public class GameServer
@@ -47,6 +46,7 @@ public class GameServer
 
             await ProcessQueuedMessages();
         }
+
     }
     public static async Task ProcessQueuedMessages()
     {
@@ -74,7 +74,6 @@ public class GameServer
     private static readonly ConcurrentDictionary<Socket, string> ClientRooms = new(); // 存储每个客户端所在的房间
 
     private static ConcurrentDictionary<int, ClientSession> ClientSessions = new();  // 用于存储客户端会话信息
-
     public static async Task StartServer()
     {
         try
@@ -102,6 +101,15 @@ public class GameServer
                     clientSocket.Close();
                     continue; // 不接受这个客户端，直接跳过
                 }
+
+
+                // 保存连接的客户端数据
+                string clientKey = $"{clientSocket.RemoteEndPoint}";
+                Clients[clientKey] = clientSocket;
+                clientHeartbeats[clientSocket] = DateTime.Now;
+                Log($"客户端 {GetClientIdPoint(clientSocket)} 连接到服务器 !!!");
+
+
 
                 _ = Task.Run(() => HandleClient(clientSocket));
             }
@@ -192,6 +200,7 @@ public class GameServer
                         {
                             if (networkMessage == null) return;
 
+                            Log($"收到来自客户端 {GetClientIdPoint(clientSocket)} NetworkMessage: 类型={networkMessage.MessageType}");
                             switch (networkMessage?.MessageType)
                             {
                                 case NetworkMessageType.GetClientId:
@@ -215,7 +224,6 @@ public class GameServer
                                     }
                                     break;
                                 default:
-                                    Log($"收到来自客户端 {GetClientIdPoint(clientSocket)} NetworkMessage: 类型={networkMessage.MessageType}");
                                     // 在接收消息时，把发送者和消息一起入队
                                     MessageQueue.Enqueue(new MessageWithSender(clientSocket, networkMessage));
                                     break;
@@ -225,9 +233,13 @@ public class GameServer
                 }
             }
         }
+        catch (ObjectDisposedException ex)
+        {
+            Log($"与客户端 {GetClientIdPoint(clientSocket)} 的连接被关闭: {ex.Message}");
+        }
         catch (Exception ex)
         {
-            Log($"与客户端 {clientSocket.RemoteEndPoint} 通信时发生错误: {ex.Message}");
+            Log($"与客户端 {GetClientIdPoint(clientSocket)} 通信时发生错误: {ex.Message}");
         }
         finally
         {
@@ -241,7 +253,7 @@ public class GameServer
     {
         //如果客户端没有ID 则服务器分配一个 然后发送给客户端
         // 如果有ID 则检查是否在ClientSessions中,如果在则是断线重连,如果不在则是新客户端
-        if (clientIdMessage.ClientId == -1)
+        if (clientIdMessage.ClientId <= 0)
         {
             bool isExist = IsExistClientId(clientIdCounter);
             while (isExist)
@@ -249,27 +261,24 @@ public class GameServer
                 clientIdCounter += 1;
                 isExist = IsExistClientId(clientIdCounter);
             }
-            string clientKey = $"{clientSocket.RemoteEndPoint}___{clientIdCounter}";
-            Clients[clientKey] = clientSocket;
+            clientHeartbeats[clientSocket] = DateTime.Now;
 
             int clientId = clientIdCounter;
             ClientIds[clientSocket] = clientId;
             clientIdCounter += 1;
-            //Log($"客户端连接: {clientSocket.RemoteEndPoint}， 客户端分配的新ID: {clientId}");
-            clientHeartbeats[clientSocket] = DateTime.Now;
 
 
-            // 将服务器分配新ID 发送给客户端
+            //Log($"将服务器分配新ID: {clientId}  发送给客户端 {GetClientIdPoint(clientSocket)}.");
             ClientIdMessage clientIdMessage2 = new ClientIdMessage
             {
                 ClientId = clientId,
                 ClientType = clientIdMessage.ClientType,
-                GlobalObjId = clientIdMessage.GlobalObjId
+                GlobalObjId = clientIdMessage.GlobalObjId,
+                type = clientIdMessage.type
             };
             NetworkMessage networkMessage = new NetworkMessage(NetworkMessageType.GetClientId, JsonToByteArray<ClientIdMessage>(clientIdMessage2));
             byte[] combinedMessage = PrepareNetworkMessage(networkMessage);
             await clientSocket.SendAsync(new ArraySegment<byte>(combinedMessage), SocketFlags.None);
-
 
             await JoinRoom(clientSocket, defaultRoomId);
 
@@ -285,17 +294,16 @@ public class GameServer
         }
         else
         {
-            string clientKey = $"{clientSocket.RemoteEndPoint}___{clientIdCounter}";
-            Clients[clientKey] = clientSocket;
-            ClientIds[clientSocket] = clientIdMessage.ClientId;
             clientHeartbeats[clientSocket] = DateTime.Now;
+            ClientIds[clientSocket] = clientIdMessage.ClientId;
 
             // 将服务器原来保存的ID 发送给客户端
             ClientIdMessage clientIdMessage2 = new ClientIdMessage
             {
                 ClientId = clientIdMessage.ClientId,
                 ClientType = clientIdMessage.ClientType,
-                GlobalObjId = clientIdMessage.GlobalObjId
+                GlobalObjId = clientIdMessage.GlobalObjId,
+                type = clientIdMessage.type
             };
             NetworkMessage networkMessage = new NetworkMessage(NetworkMessageType.GetClientId, JsonToByteArray<ClientIdMessage>(clientIdMessage2));
             byte[] combinedMessage = PrepareNetworkMessage(networkMessage);
@@ -848,7 +856,14 @@ public class GameServer
     }
     public static string GetClientIdPoint(Socket clientSocket)
     {
-        return $"{clientSocket.RemoteEndPoint}___{ClientIds[clientSocket]}";
+        if (ClientIds.ContainsKey(clientSocket))
+        {
+            return $"{clientSocket.RemoteEndPoint}___{ClientIds[clientSocket]}";
+        }
+        else
+        {
+            return $"{clientSocket.RemoteEndPoint}___";
+        }
     }
     public static string GetLocalIPAddress()
     {
